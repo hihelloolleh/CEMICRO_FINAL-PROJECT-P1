@@ -118,9 +118,17 @@ def main(argv):
         while eprom_count < eprom_limit:
             byte = ser.read()
             if byte:
-                # Display format: Address Offset : Data
                 val = ord(byte)
-                print(f"Addr {eprom_count:02d}: {hex(val)} ({val})")
+                
+                # Check for printable ASCII range (Space 32 to Tilde 126)
+                if 32 <= val <= 126:
+                    ascii_out = f"'{chr(val)}'"
+                else:
+                    ascii_out = "ASCII out of range"
+
+                # Display format: Address Offset : Hex (Dec) : ASCII
+                print(f"Addr {eprom_count:02d}: {hex(val)} ({val})\t: {ascii_out}")
+                
                 eprom_count += 1
             else:
                 print("\nTimeout waiting for EPROM data.")
