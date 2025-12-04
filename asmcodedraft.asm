@@ -8,13 +8,17 @@ STACK   EQU  $00FF
 PORTA   EQU  $00      ; 1000h
 PORTC   EQU  $03      ; 1003h
 PORTB   EQU  $04      ; 1004h
+
 DDRC    EQU  $07      ; 1007h
-SCSR    EQU  $2E      ; 102Eh
-SCDR    EQU  $2F      ; 102Fh
+BAUD    EQU  $2B      ; 102Bh - Baud Rate Control
+SCCR2   EQU  $2D      ; 102Dh - Serial Control Register 2
+SCSR    EQU  $2E      ; 102Eh - Status
+SCDR    EQU  $2F      ; 102Fh - Data
 
 ; --------------------- RAM VARIABLES ---------------------
-ADDR    RMB  1        ; EPROM address counter (0 → 24)
-TMP     RMB  1        ; storage for EPROM read byte
+ADDR    RMB  1        ; EPROM address counter
+TMP     RMB  1        ; Storage for read byte
+N_COUNT RMB  1        ; 'n' counter
 
 ; --------------------- SAMPLE DATA (25 BYTES) ---------------------
 PATTERN:
@@ -24,130 +28,201 @@ PATTERN:
         ORG  PROGRAM
 
 START:
-        SEI                     ; disable interrupts
-        LDS     #STACK          ; init stack pointer
+        SEI                     ; Disable interrupts
+        LDS     #STACK
         LDX     #BASE           ; X = 1000h (I/O base)
 
-        ; PORT SETUP
-        CLR     DDRC,X          ; Port C = INPUT (for READ)
-        BSET    PORTA,X $40     ; PA6 HIGH (default: disable EPROM)
-        CLR     ADDR            ; start address = 0
+        ; --- SERIAL SETUP ---
+        LDAA    #$30            ; 9600 Baud (8MHz crystal)
+        STAA    BAUD,X
+        LDAA    #$08            ; Enable Transmitter (TE) - bit 3
+        STAA    SCCR2,X
 
-        CLI                     ; enable interrupts again
+        ; --- PORT SETUP ---
+        CLR     DDRC,X          ; Port C = INPUT
+        BSET    PORTA,X $60     ; PA6(P) & PA5(G) HIGH (Disable EPROM)
+        
+        CLR     ADDR            ; Start address = 0
+        
+        ; --- STARTUP DELAY ---
+        ; Wait here to let the PC connect properly
+        JSR     DELAY_STARTUP
+
+        CLI                     ; Enable interrupts
         BRA     MAIN_LOOP
 
 ; --------------------- MAIN PROGRAM ---------------------
 MAIN_LOOP:
-        JSR     WRITE           ; First write 25 bytes to chip
-        JSR     READ            ; Then read 25 bytes back from chip
+        JSR     WRITE
+        JSR     READ            ; Read back and send to PC
 HALT:
         SWI                     ; Stop program
 
 ; --------------------- WRITE SUBROUTINE ---------------------
 WRITE:
         LDX     #BASE
-        LDAB    #25             ; Write 25 bytes
-        LDAA    #0              ; pattern index
+        LDY     #PATTERN        ; Y points to data array
+        LDAB    #25             ; Total bytes to write
+        CLR     ADDR
 
-WRITE_LOOP:
-        ; Send address to EPROM
-        PSHB
+WRITE_OUTER_LOOP:
+        LDAA    #1              ; n = 1
+        STAA    N_COUNT
+
+ATTEMPT_LOOP:
+        ; SETUP ADDRESS & DATA
+        PSHB                    ; Save Loop Counter
         LDAA    ADDR
-        STAA    PORTB,X         ; Address bus out
-        PULA
+        STAA    PORTB,X         ; Address Bus Out
 
-        ; PORTC = OUTPUT for data bus
-        BSET    DDRC,X $FF
-        LDY     #$0200
+        BSET    DDRC,X $FF      ; Port C -> OUTPUT
+        LDAA    0,Y             ; Load Pattern Data
+        STAA    PORTC,X         ; Data Bus Out
 
-DDRC_DELAY_W:
-        DEY
-        BNE     DDRC_DELAY_W
+        ; CONTROL SIGNALS (Program Mode)
+        ; Program Pulse: CE' - LOW, OE' - HIGH, P' - LOW
+        BSET    PORTA,X $20     ; G (PA5) -> HIGH (Disable Output)
+        BSET    PORTA,X $40     ; P (PA6) -> HIGH (Idle)
 
-        ; Output data byte
-        LDAA    PATTERN,X       ; simulation (can replace with real source)
+        ; P = 1ms Pulse
+        BCLR    PORTA,X $40     ; P -> LOW (Start Pulse)
+        JSR     DELAY_1MS       ; Wait 1ms
+        BSET    PORTA,X $40     ; P -> HIGH (End Pulse)
+
+        ; Verification
+        CLR     DDRC,X          ; Port C -> INPUT
+        BCLR    PORTA,X $20     ; G -> LOW (Enable EPROM Output)
+        
+        ; Small delay for signal stabilization
+        NOP
+        NOP
+        NOP
+        NOP
+
+        LDAA    PORTC,X         ; Read Data
+        CMPA    0,Y             ; Compare with Desired Pattern
+        BEQ     VERIFY_PASS
+
+        ; Verify (Failed)
+        BSET    PORTA,X $20     ; G -> HIGH (Disable EPROM)
+        PULB                    ; Restore Stack
+
+        INC     N_COUNT
+        
+        LDAA    N_COUNT
+        CMPA    #26             ; compare if  > 25?
+        BEQ     WRITE_FAILURE   ; If n=26, fail
+        
+        BRA     ATTEMPT_LOOP    ; Loop back to Pulse again
+
+        ; Verify (Pass)
+VERIFY_PASS:
+        BSET    PORTA,X $20     ; G -> HIGH
+        PULB                    ; Restore Stack
+
+        ; P = 3ms * n Pulse
+        ; We must Write again to apply the "Locking" pulse
+        BSET    DDRC,X $FF      ; Port C -> OUTPUT
+        LDAA    0,Y
         STAA    PORTC,X
 
-        ; Pulse PA6 : LOW → HIGH → LOW
-        BCLR    PORTA,X $40     ; LOW
-        LDY     #$00FF
+        ; Start Pulse
+        BCLR    PORTA,X $40     ; P -> LOW
+        
+        ; Wait loop: Call 3ms delay 'N_COUNT' times
+        LDAA    N_COUNT         
+OVERPROG_LOOP:
+        JSR     DELAY_3MS       ; Wait 3ms
+        DECA                    ; Decrement 'n' copy
+        BNE     OVERPROG_LOOP   ; Repeat
+        
+        ; End Pulse
+        BSET    PORTA,X $40     ; P -> HIGH
 
-PULSE_LO_W:
-        DEY
-        BNE     PULSE_LO_W
-        BSET    PORTA,X $40     ; HIGH
-        LDY     #$00FF
+        INY                     ; Next Data Byte
+        INC     ADDR            ; Next Address
+        
+        DECB                    ; Decrement Total Counter
+        BNE     WRITE_OUTER_LOOP ; If not done, next byte
 
-PULSE_HI_W:
-        DEY
-        BNE     PULSE_HI_W
-        BCLR    PORTA,X $40     ; LOW again
-
-        ; Move to next address
-        PULB
-        INC     ADDR
-        DECB
-        BNE     WRITE_LOOP
-
+        ; Cleanup
+        CLR     DDRC,X
         RTS
+
+WRITE_FAILURE:
+        PULB                    ; Clean stack
+        SWI                     ; Stop execution (Error)
 
 ; --------------------- READ SUBROUTINE ---------------------
 READ:
         LDX     #BASE
-        LDAB    #25             ; Read 25 bytes
-        CLRA                    ; pattern index reset
-
+        LDAB    #25             
+        CLR     ADDR
 READ_LOOP:
-        ; Send address to EPROM via PORTB
-        PSHB
+        PSHB                    
         LDAA    ADDR
-        STAA    PORTB,X         ; Address bus out
-        PULA
+        STAA    PORTB,X
 
-        ; Enable EPROM output (PA6 LOW)
-        BCLR    PORTA,X $40
-        LDY     #$00FF
+        ; Signals: P=High, G=Low
+        BSET    PORTA,X $40     ; PA6(P) HIGH
+        BCLR    PORTA,X $20     ; PA5(G) LOW (Enable Output)
+        
+        ; Wait for data
+        NOP
+        NOP
+        NOP
+        NOP
 
-PULSE_STABLE_R:
-        DEY
-        BNE     PULSE_STABLE_R
+        CLR     DDRC,X          
+        LDAA    PORTC,X         
+        STAA    TMP             
 
-        ; Configure PORTC as INPUT for data read
-        CLR     DDRC,X          ; back to input
-
-        ; Small delay to stabilize data
-        LDY     #$0200
-
-DATA_STABLE_R:
-        DEY
-        BNE     DATA_STABLE_R
-
-        ; Read data byte from PORTC
-        LDAA    PORTC,X         ; Data bus in
-        STAA    TMP             ; Store to RAM
-
-        ; Send byte to Serial (UART)
         JSR     SEND_SERIAL
 
-        ; Disable EPROM output (PA6 HIGH)
-        BSET    PORTA,X $40
+        BSET    PORTA,X $20     ; G -> High
 
-        ; Next address
-        PULB
+        PULB                    
         INC     ADDR
         DECB
         BNE     READ_LOOP
-
         RTS
 
-; --------------------- SEND SERIAL SUBROUTINE ---------------------
+; --------------------- SERIAL SUBROUTINE ---------------------
 SEND_SERIAL:
         LDX     #BASE
-
-WAIT_TX_EMPTY:
+WAIT_TX:
         LDAA    SCSR,X
-        ANDA    #$80            ; check TDRE bit (transmit empty)
-        BEQ     WAIT_TX_EMPTY
-        LDAA    TMP
-        STAA    SCDR,X
+        ANDA    #$80            
+        BEQ     WAIT_TX         
+        LDAA    TMP             
+        STAA    SCDR,X          
+        RTS
+
+; --------------------- DELAY SUBROUTINES ---------------------
+
+; 1ms Delay (Assuming 2MHz E-Clock)
+DELAY_1MS:
+        PSHX
+        LDX     #$014D          ; ~333 loops
+D1_LOOP: DEX
+        BNE     D1_LOOP
+        PULX
+        RTS
+
+; 3ms Delay (Calls 1ms x 3)
+DELAY_3MS:
+        JSR     DELAY_1MS
+        JSR     DELAY_1MS
+        JSR     DELAY_1MS
+        RTS
+
+; Startup Delay (~1 Second)
+DELAY_STARTUP:
+        PSHY
+        LDY     #$03E8          ; Loop 1000 times
+DS_LOOP:
+        JSR     DELAY_1MS
+        DEY
+        BNE     DS_LOOP
+        PULY
         RTS
