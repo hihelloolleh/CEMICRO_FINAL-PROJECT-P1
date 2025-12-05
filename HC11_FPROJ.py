@@ -1,21 +1,119 @@
-# Program arguments:  -c /dev/ttyUSB0 -i phase1.s19
+#!/usr/bin/env python3
+# Program arguments:  -c /dev/ttyUSB0 -i BOOTLOAD.S19
+#
+# HC11 Bootload Mode RAM Loader — cleaned and fixed (preserve original logic)
 
-import sys, getopt
+import sys
+import getopt
 import serial
 import time
+import os
+
+
+def hex_to_ascii(input_string):
+    """Convert a hex byte string (e.g. '0x41' or '41') to printable ASCII (or placeholders)."""
+    if not isinstance(input_string, str):
+        raise TypeError("ERROR: Input is not a string")
+
+    # Normalize input: remove any '0x' prefixes and whitespace
+    s = input_string.replace('0x', '').replace('0X', '').replace(' ', '')
+
+    if len(s) % 2 != 0:
+        raise ValueError("ERROR: Incomplete string argument.")
+    if any(c not in "0123456789abcdefABCDEF" for c in s):
+        raise ValueError("Invalid character in input.")
+
+    result = []
+    for i in range(0, len(s), 2):
+        hex_pair = s[i:i+2]
+        val = int(hex_pair, 16)
+
+        # Only allow values up to 0xFF
+        if val > 0xFF:
+            result.append("N/A")
+            continue
+
+        # Restrict to ASCII: printable range 0x20-0x7E
+        if 0x20 <= val <= 0x7E:
+            result.append(chr(val))
+        # Allow common whitespace control characters (tab/newline/carriage return)
+        elif val in (0x09, 0x0A, 0x0D):
+            result.append(chr(val))
+        else:
+            # Non-printable or extended Unicode: replace with a placeholder
+            result.append('---')
+
+    return ''.join(result)
+
+
+def read_eprom_data(ser):
+    """Read 25 bytes from serial and print a formatted hex + ASCII view."""
+    EXPECTED = 25
+    print("\n-------------------------------------------------")
+    print(f"Waiting for {EXPECTED} bytes from EPROM...")
+    print(f"(Will timeout after {ser.timeout} seconds...)\n")
+
+    try:
+        data = ser.read(EXPECTED)
+
+        if not data:
+            print("ERROR: Read timeout. No data received from HC11.")
+            return
+
+        if len(data) < EXPECTED:
+            print(f"WARNING: Received only {len(data)} bytes, expected {EXPECTED}.")
+            lString = "DATA from 2764"
+            padded_lString = lString.rjust(30)
+            print(f"'{padded_lString}' | ")
+
+        # Print the data in a nice hex + ASCII format, 8 bytes per line
+        hex_lines = []
+        line_hex_parts = []
+        line_ascii_parts = []
+        for i, byte in enumerate(data):
+            if isinstance(byte, int):
+                byte_val = byte
+            else:
+                # in case serial returns a 1-length bytes object
+                byte_val = byte[0]
+
+            hex_val = f"0x{byte_val:02X}"
+            ascii_res = hex_to_ascii(hex_val)
+            line_hex_parts.append(hex_val.rjust(6))
+            # ascii_res may be multiple chars if nonstandard; ensure fixed width display
+            ascii_display = ascii_res if len(ascii_res) == 1 else ascii_res[0]
+            line_ascii_parts.append(ascii_display)
+
+            # Every 8 bytes, flush line
+            if (i + 1) % 8 == 0 or (i + 1) == len(data):
+                hex_line = ' '.join(line_hex_parts)
+                ascii_line = ''.join(line_ascii_parts)
+                hex_lines.append(f"{hex_line}   | {ascii_line}")
+                line_hex_parts = []
+                line_ascii_parts = []
+
+        print('\n'.join(hex_lines))
+        print("\n-------------------------------------------------")
+
+    except serial.SerialException as e:
+        print(f"ERROR: Serial communication error: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
 
 def main(argv):
     comport = ''
     s19file = ''
-    loopback = False;
+    loopback = False
     try:
-        opts, arg = getopt.getopt(argv,"hlc:i:",["port","ifile="])
+        opts, _ = getopt.getopt(argv, "hlc:i:", ["port=", "ifile="])
     except getopt.GetoptError:
-        print ('HC11_bootload -c <COM_port> -i <s19_inputfile>')
+        print('Usage: HC11_bootload -c <COM_port> -i <s19_inputfile> [-l]')
         sys.exit(2)
+
     for opt, arg in opts:
         if opt == '-h':
-            print ('HC11_bootload -c <COM_port> -i <s19_inputfile>')
+            print('Usage: HC11_bootload -c <COM_port> -i <s19_inputfile> [-l]')
             sys.exit()
         elif opt == '-l':
             loopback = True
@@ -24,122 +122,150 @@ def main(argv):
         elif opt in ("-i", "--ifile"):
             s19file = arg
 
-    print('HC11 Bootload Mode RAM Loader, v0.2 Clem Ong  note: this ver limited to 256-byte progs.')
+    if not comport:
+        print("ERROR: No COM port specified. Use -c <COM_port>")
+        sys.exit(2)
+    if not s19file:
+        print("ERROR: No S19 input file specified. Use -i <s19_inputfile>")
+        sys.exit(2)
+    if not os.path.isfile(s19file):
+        print(f"ERROR: S19 file not found: {s19file}")
+        sys.exit(2)
+
+    print('HC11 Bootload Mode RAM Loader, v0.2 Clem Ong  (cleaned version)')
     print()
     print('Program will use', comport)
-    print('Parsing ', s19file,':', sep = '')
+    print('Parsing ', s19file, ':', sep='')
 
-    ser = serial.Serial (port = comport, baudrate = 1200, timeout = 6.5)   # linux: /dev/tty/usb…  Windows: COMx
+    try:
+        ser = serial.Serial(port=comport, baudrate=1200, timeout=6.5, write_timeout=6.5)
+    except serial.SerialException as e:
+        print(f"ERROR: Could not open serial port {comport}: {e}")
+        sys.exit(2)
 
-    machine_code = bytearray(256);
-    i = 0
-    while i < 256:
-        machine_code[i] = 0
-        i += 1
+    # Prepare 256-byte RAM image (initialized to 0)
+    machine_code = bytearray(256)
 
-    f = open(s19file)
-    line= f.readline()
+    # Parse the S19 file and stuff bytes into machine_code
+    try:
+        with open(s19file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith('S1'):
+                    try:
+                        bcount = int(line[2:4], 16)
+                        dcount = bcount - 3    # 2 bytes for address, 1 byte checksum
+                        addr = int(line[4:8], 16)
+                    except Exception as e:
+                        print(f"WARNING: Failed to parse line: {line} -> {e}")
+                        continue
 
-    j = 0
-    while line: 
-        if line[0:2] == 'S1':
-            bcount = int(line[2:4],16)
-            dcount = bcount-3    
-            i = 0
-            j = int(line[4:8],16)
-            k = 0
+                    print(f"@ {hex(addr)}:", end=' ')
+                    # data starts at position 8, each data byte is 2 hex chars
+                    p = 8
+                    for k in range(dcount):
+                        byte_hex = line[p:p+2]
+                        try:
+                            machine_code[addr] = int(byte_hex, 16)
+                            # print lower-case 2-digit hex as original displayed
+                            print(f"{machine_code[addr]:02x}", end=' ')
+                        except Exception as e:
+                            print(f"\nWARNING: invalid data byte '{byte_hex}' at addr {addr}: {e}")
+                        addr += 1
+                        p += 2
+                    print()
+    except OSError as e:
+        print(f"ERROR: Could not read S19 file: {e}")
+        ser.close()
+        sys.exit(2)
 
-            print ("@", hex(j), end = ":")
-            while k < (dcount):
-                machine_code[j] = int(line[i+8:i+10],16)  
-                byte = hex(machine_code[j])[-2:]
-                if byte[0] == 'x':
-                    byte = "0" + byte[-1:]
-                print (byte, end =' ')
-                i += 2
-                j += 1
-                k += 1
-        line = f.readline()
-        print ()
-    f.close()   
-    
-    print ('Input S19 file parsed. ', end = ' ')
-    ser.write (b"\x00")
-    print ('Press the RESET button of the HC11 board now.')
+    print('Input S19 file parsed.', end=' ')
+    try:
+        ser.write(b"\x00")
+    except Exception as e:
+        print(f"\nERROR: Failed to write to serial port: {e}")
+        ser.close()
+        sys.exit(2)
+
+    print('Press the RESET button of the HC11 board now.')
     input('Program is paused - press Enter on keyboard after HC11 RESET.')
     time.sleep(1.0)
 
+    # Send sync byte 0xFF then the 256-byte RAM image
     print('Serial coms to HC11: Sending 0xFF and the rest of the code... ')
-    ser.write(b"\xff")
+    try:
+        ser.write(b"\xff")
+        ser.write(machine_code)
+    except serial.SerialTimeoutException as e:
+        print(f"ERROR: Serial write timeout: {e}")
+        ser.close()
+        sys.exit(2)
+    except serial.SerialException as e:
+        print(f"ERROR: Serial communication error while writing: {e}")
+        ser.close()
+        sys.exit(2)
 
-    ser.write(machine_code)  
     print()
+    print("Waiting for echoback from HC11.  If you don't see anything on screen, something is wrong...")
 
-# Read back what the HC11 (should have) sent back, which is an echo of what it received:
-    print("Waiting for echoback from HC11.  If you don't see anthing on screen, something is wrong...")
-    
-    byte = ser.read()   
-    if not byte:
-        print ('HC11 is not sending anything back - aborting.')
+    # Read first byte (may be sync or echo)
+    first = ser.read(1)
+    if not first:
+        print('HC11 is not sending anything back - aborting.')
+        ser.close()
+        sys.exit(1)
+
+    # Determine echo behavior
+    if loopback:
+        print('Sync:', hex(first[0]))
+        j = 256
     else:
-        if loopback:
-            print('Sync:', hex(ord(byte)))
-            j = 256
+        print(hex(first[0]), end=' ')
+        j = 255
+
+    echo_success = True
+
+    # Read remaining bytes (expect j bytes)
+    while j > 0:
+        b = ser.read(1)
+        if b:
+            val = b[0]
+            print(f'0x{val:02x}', end=' ')
+            j -= 1
+            if j % 17 == 0:
+                print("\n")
         else:
-            print (hex(ord(byte)), end = ' ')
-            j = 256
-        
-        while j > 0:
-            byte = ser.read()
-            if byte:
-                print (hex(ord(byte)), end = ' ')
-                j -= 1
-            else:
-                print ("Error in received data - aborting.")
-                j = 0           
-        print('\n\n')
-        print ('Done - HC11 should be running your machine code in RAM now.')
-        
-        # ---------------------------------------------------------------------
-        # [MODIFIED] SECTION: READ EPROM DATA
-        # Based on the transcript, Phase 1 requires reading 25 bytes sent back
-        # by the HC11 after the bootload process is complete.
-        # ---------------------------------------------------------------------
-        print("-" * 60)
-        print("PHASE 1 PROJECT: Reading 25 Bytes from EPROM...")
-        print("-" * 60)
-        
-        eprom_count = 0
-        eprom_limit = 25
-        
-        # We might need to reset the timeout or handle slow reads
-        ser.timeout = 10.0 
+            print("\nError in received data - aborting.")
+            echo_success = False
+            break
 
-        while eprom_count < eprom_limit:
-            byte = ser.read()
-            if byte:
-                val = ord(byte)
-                
-                # Check for printable ASCII range (Space 32 to Tilde 126)
-                if 32 <= val <= 126:
-                    ascii_out = f"'{chr(val)}'"
-                else:
-                    ascii_out = "ASCII out of range"
+    print('\n\n')
 
-                # Display format: Address Offset : Hex (Dec) : ASCII
-                print(f"Addr {eprom_count:02d}: {hex(val)} ({val})\t: {ascii_out}")
-                
-                eprom_count += 1
-            else:
-                print("\nTimeout waiting for EPROM data.")
-                break
-        
-        print("\nEPROM Read Complete.")
-        # ---------------------------------------------------------------------
-        # [END MODIFIED SECTION]
-        # ---------------------------------------------------------------------
+    if echo_success:
+        print('Done - HC11 should be running your machine code in RAM now.')
+        print('Switching to 9600 baud to listen for EPROM data...')
+
+        try:
+            ser.close()
+            ser.baudrate = 9600
+            ser.timeout = 60.0  # New timeout for reading EPROM data
+            ser.open()
+        except serial.SerialException as e:
+            print(f"ERROR: Could not re-open serial port at 9600: {e}")
+            ser.close()
+            sys.exit(2)
+
+        # Read EPROM data twice as original program did
+        read_eprom_data(ser)
+        print("\n\nCHECK BYTES\n")
+        read_eprom_data(ser)
+    else:
+        print('Echo failed. Will not attempt to read EPROM data.')
 
     ser.close()
+
 
 if __name__ == "__main__":
     main(sys.argv[1:])
