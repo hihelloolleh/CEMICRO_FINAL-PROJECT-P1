@@ -212,7 +212,7 @@ def main(argv):
 
         ser.close()
         ser.baudrate = 9600
-        ser.timeout = 60
+        ser.timeout = 30
         ser.open()
 
         read_eprom_data(ser)
@@ -227,3 +227,4 @@ def main(argv):
 
 if __name__ == "__main__":
     main(sys.argv[1:])
+
