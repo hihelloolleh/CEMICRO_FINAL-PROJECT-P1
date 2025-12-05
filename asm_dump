@@ -1,0 +1,13 @@
+1. Initialize address counter (ADDR = 0)
+2. Main write loop begins
+3. Output address to EPROM
+4. save registers (PSHA, PSHB) *
+5. Load data pattern count (for sanity check??????)
+6. exit with failure if di nagwwrite (idk how to explain)
+  - like just print whatever nakuha na write value then end
+7. configure portc and output for data bus
+8. apply small delay to give hc11 to apply DDRC
+
+want to implement:
+- display 25 bytes for read (to make sure that eprom is reading... sanity check b)
+- another 25 bytes to display for writing (tho im not sure coz this might be byte 26 or so or idk ;;)
