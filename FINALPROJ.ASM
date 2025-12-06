@@ -1,61 +1,265 @@
-; HC11 Final Project Phase 1 - EPROM Reader (First 25 Bytes)
-; Based on lecture hardware mapping:
-; Port B -> EPROM Address (A0-A7)
-; Port C -> EPROM Data (D0-D7)
-; Port A -> EPROM Control (CE/OE) - Using PA6 (Bit 6) as Control
+; --------------------- REGISTER DEFINITIONS ---------------------
+PROGRAM EQU  $0000
+BASE    EQU  $1000
+STACK   EQU  $00FF
 
-        ORG     $0000           ; RAM Start for Bootstrap Mode
+PORTA   EQU  $00      ; 1000h
+PORTC   EQU  $03      ; 1003h
+PORTB   EQU  $04      ; 1004h
 
-BASE    EQU     $1000           ; Register Base Address
-PORTA   EQU     $00             ; Port A
-PORTC   EQU     $03             ; Port C
-PORTB   EQU     $04             ; Port B
-DDRC    EQU     $07             ; Data Direction Register C
-SCSR    EQU     $2E             ; Serial Comm Status Register
-SCDR    EQU     $2F             ; Serial Comm Data Register
+DDRC    EQU  $07      ; 1007h
+BAUD    EQU  $2B      ; 102Bh - Baud Rate Control
+SCCR2   EQU  $2D      ; 102Dh - Serial Control Register 2
+SCSR    EQU  $2E      ; 102Eh - Status
+SCDR    EQU  $2F      ; 102Fh - Data
+
+; --------------------- RAM VARIABLES ---------------------
+ADDR    RMB  1        ; EPROM address counter
+TMP     RMB  1        ; Storage for read byte
+N_COUNT RMB  1        ; 'n' counter (1 to 25)
+
+; --------------------- SAMPLE DATA ---------------------
+PATTERN:
+        FCB  $00,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0A,$0B,$0C,$0D,$0E,$0F,$10,$11,$12,$13,$14,$15,$16,$17,$18
+
+; --------------------- PROGRAM START ---------------------
+        ORG  PROGRAM
 
 START:
-        LDS     #$00FF          ; Initialize Stack Pointer to top of RAM
-        LDX     #BASE           ; Point Index Register X to Register Block
+        SEI                     ; Disable interrupts
+        LDS     #STACK          ; Init stack pointer
+        LDX     #BASE           ; X = 1000h
 
-        ; 1. Configure Ports based on transcript
-        CLR     DDRC,X          ; Set DDRC to 0 -> Port C becomes INPUT (Read EPROM Data)
-                                ; Port B is Output-only by default (EPROM Address)
-                                ; Port A Bit 6 is Output by default (Control)
+        ; --- SERIAL SETUP ---
+        LDAA    #$30            ; 9600 Baud (for 8 MHz crystal)
+        STAA    BAUD,X
+        LDAA    #$08            ; Enable Transmitter (bit 3)
+        STAA    SCCR2,X
+
+        ; --- PORT SETUP ---
+        CLR     DDRC,X          ; Port C = INPUT
         
-        BSET    PORTA,X $40     ; Set PA6 HIGH (Disable EPROM Output initially)
-                                ; Assuming Active Low logic for OE/CE
+        ; INITIAL STATE: H H H (Idle)
+        ; PA6(OE)=1, PA5(P)=1, PA4(CE)=1
+        ; PA3=0 (PSU Off)
+        ; Binary: 0111 0000 = Hex $70
+        LDAA    #$70
+        STAA    PORTA,X     
+        
+        CLR     ADDR            
+        
+        JSR     DELAY_STARTUP   ; Wait for PC to connect
+        CLI                     
+        BRA     MAIN_LOOP
 
-        CLRB                    ; Accumulator B will act as our Loop Counter & Address
-                                ; (Counts 0 to 25)
+; --------------------- MAIN PROGRAM ---------------------
+MAIN_LOOP:
+        JSR     READ
+        JSR     WRITE
+        JSR     READ
 
+END	BRA	END
+
+; --------------------- WRITE SUBROUTINE ---------------------
+WRITE:
+        LDX     #BASE
+        LDY     #PATTERN        
+        LDAB    #25             ; Total bytes to write
+        CLR     ADDR
+
+RETRY:
+        LDAA    #1
+        STAA    N_COUNT		; RETRY COUNTER
+
+        ; [PSU CONTROL] Turn on High Voltage (13V)
+        ; Using PA3 ($08) now - No Config needed!
+        BSET    PORTA,X $F8     
+
+ATTEMPT_LOOP:
+        ; Setup Address & Data
+        PSHB                    
+        LDAA    ADDR
+        STAA    PORTB,X		; Address out       
+
+        BSET    DDRC,X $FF      ; Port C -> OUTPUT
+        LDAA    0,Y             
+        STAA    PORTC,X		; Data out         
+
+        ; OE(6)=H, P(5)=H, CE(4)=L
+        BCLR    PORTA,X $10     ; PA4 -> LOW
+        NOP
+
+        ; OE(6)=H, P(5)=L, CE(4)=L
+        ; Start Pulse
+        BCLR    PORTA,X $20     ; PA5 -> LOW
+        
+        JSR     DELAY_1MS       ; 1ms Pulse
+        
+        ; OE(6)=H, P(5)=H, CE(4)=L
+        ; End Pulse
+        BSET    PORTA,X $20     ; PA5 -> HIGH
+        NOP
+        
+        ; OE(6)=L, P(5)=H, CE(4)=L
+        ; Switch to Input Mode first!
+        CLR     DDRC,X          
+        BCLR    PORTA,X $50     ; PA6 -> LOW
+        
+        NOP
+        NOP
+        
+        ; READ DATA
+        LDAA    PORTC,X         
+        CMPA    0,Y             
+        BEQ     VERIFY_PASS     
+
+        ; -----------------------------
+        ; VERIFY FAILED
+        ; -----------------------------
+        ; OE(6)=H, P(5)=H, CE(4)=L
+        BSET    PORTA,X $40     ; PA6 -> HIGH
+        
+	NOP
+	NOP
+        
+	; OE(6)=H, P(5)=H, CE(4)=H
+        BSET    PORTA,X $10     ; PA4 -> HIGH (Reset)
+
+        INC     N_COUNT         ; Increment n
+        LDAA    N_COUNT
+        CMPA    #25             ; Check limit
+        BEQ     WRITE_FAILURE   
+
+        BRA     ATTEMPT_LOOP    ; Retry
+
+        ; -----------------------------
+        ; VERIFY PASSED
+        ; -----------------------------
+
+VERIFY_PASS:
+        ; OE(6)=H, P(5)=H, CE(4)=L
+        BSET    PORTA,X $E0     ; PA6 -> HIGH
+        
+        ; Note: We keep CE Low ($10) because we need to pulse again!
+        PULB                    
+
+        ; OVERPROGRAM PULSE (3ms * n)
+        BSET    DDRC,X $FF      ; Port C -> OUTPUT
+        LDAA    0,Y
+        STAA    PORTC,X
+
+        ; OE(6)=H, P(5)=L, CE(4)=L
+        BCLR    PORTA,X $20     ; PA5 -> LOW
+        
+        ; Wait loop: (3ms) * (n)
+        
+	LDAA    N_COUNT         
+OVERPROG_LOOP:
+        JSR     DELAY_3MS       
+        DECA                    
+        BNE     OVERPROG_LOOP   
+        
+        ; OE(6)=H, P(5)=H, CE(4)=L
+        BSET    PORTA,X $20     ; PA5 -> HIGH
+
+        ; OE(6)=H, P(5)=H, CE(4)=H
+        ; Done with this byte
+        BSET    PORTA,X $10     ; PA4 -> HIGH
+
+          
+
+        ; NEXT BYTE
+        INY                     
+        INC     ADDR            
+        DECB                    
+        BNE     RETRY 
+
+	; [PSU CONTROL] Turn off High Voltage (5V Safe Mode)
+        BCLR    PORTA,X $08   
+
+        CLR     DDRC,X
+        RTS
+
+WRITE_FAILURE:
+        BCLR    PORTA,X $08     ; Safety: Turn off HV
+        PULB                    
+END	BRA	END                     
+
+; --------------------- READ SUBROUTINE ---------------------
+READ:
+        LDX     #BASE
+        LDAB    #25             
+        CLR     ADDR
 READ_LOOP:
-        CMPB    #25             ; Check if we have read 25 bytes
-        BEQ     DONE            ; If B == 25, we are finished
+        PSHB                    
+        LDAA    ADDR
+        STAA    PORTB,X
 
-        ; 2. Set Address
-        STAB    PORTB,X         ; Output current count (B) to Port B (EPROM Address)
+        ; OE(6)=H, P(5)=H, CE(4)=H (idle)
+        ; Also ensure PSU is Low (PA3=0)
+        BCLR    PORTA,X $08
+        BSET    PORTA,X $70     
 
-        ; 3. Control Signal (Pulse OE/CE Low)
-        BCLR    PORTA,X $40     ; Clear PA6 -> Low (Enable EPROM Output)
+        ; OE(6)=H, P(5)=H, CE(4)=L
+        BCLR    PORTA,X $10     ; PA4 -> LOW
+
+        ; OE(6)=L, P(5)=H, CE(4)=L
+        BCLR    PORTA,X $40     ; PA6 -> LOW
         
-        NOP                     ; Short delay for EPROM access time (tACC)
-        NOP                     ; (HC11 is fast, EPROM might be slow)
+        ; Delay for data access
+        NOP
+        NOP
 
-        ; 4. Read Data
-        LDAA    PORTC,X         ; Read EPROM data from Port C into Accumulator A
+        ; READ DATA
+        CLR     DDRC,X          
+        LDAA    PORTC,X         
+        STAA    TMP             
 
-        ; 5. Disable EPROM
-        BSET    PORTA,X $40     ; Set PA6 -> High (Disable EPROM Output)
+        JSR     SEND_SERIAL
 
-        ; 6. Send Data to PC via Serial (SCI)
-        ; Note: Baud rate is already set by the Bootloader process before this runs
-TX_WAIT:
-        BRCLR   SCSR,X $80 TX_WAIT ; Wait until TDRE (Transmit Data Reg Empty) bit is set
-        STAA    SCDR,X          ; Send the byte in Acc A to Serial
+        ; OE(6)=H, P(5)=H, CE(4)=H
+        LDAA    PORTA,X
+        ORAA    #$50            ; Set Bit 6 ($40) and Bit 4 ($10)
+        STAA    PORTA,X         
 
-        INCB                    ; Increment Loop Counter / Address
-        BRA     READ_LOOP       ; Repeat
+        PULB                    
+        INC     ADDR
+        DECB
+        BNE     READ_LOOP
+        RTS
 
-DONE:
-        BRA     DONE            ; Infinite loop to stop execution
+; --------------------- SERIAL SUBROUTINE ---------------------
+SEND_SERIAL:
+        BRCLR   SCSR,X $80 SEND_SERIAL 	; Wait until TDRE (Transmit Data Reg Empty) bit is set
+        STAA    SCDR,X          	; Send the byte in Acc A to Serial
+
+
+        RTS
+
+; --------------------- DELAY SUBROUTINES ---------------------
+; 1ms Delay (Assuming 2MHz E-Clock)
+DELAY_1MS:
+        PSHX
+        LDX     #$014D          ; ~333 loops
+D1_LOOP: DEX
+        BNE     D1_LOOP
+        PULX
+        RTS
+
+; 3ms Delay (Calls 1ms x 3)
+DELAY_3MS:
+        JSR     DELAY_1MS
+        JSR     DELAY_1MS
+        JSR     DELAY_1MS
+        RTS
+
+; Startup Delay (~1 Second)
+DELAY_STARTUP:
+        PSHY
+        LDY     #$03E8          
+DS_LOOP:
+        JSR     DELAY_1MS
+        DEY
+        BNE     DS_LOOP
+        PULY
+        RTS
